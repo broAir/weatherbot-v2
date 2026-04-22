@@ -13,7 +13,7 @@ The foundation. Scans 6 US cities, fetches forecasts from NWS using airport stat
 
 No math, no complexity. Just the core logic — good for understanding how the system works.
 
-### `bot_v2.py` — Full Bot (current)
+### `weatherbet.py` — Full Bot (current)
 Everything in v1, plus:
 - **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
 - **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
@@ -65,59 +65,73 @@ Every Polymarket weather market resolves on a specific airport station. NYC reso
 ```bash
 git clone https://github.com/alteregoeth-ai/weatherbot
 cd weatherbot
-pip install requests
+pip install requests py-clob-client eth-account
 ```
 
-`config.json` is tracked with placeholders only. Keep real keys in `config.local.json` (ignored by git) or environment variables.
-
-`config.json`:
+Create `config.json` in the project folder:
 ```json
 {
   "balance": 10000.0,
   "max_bet": 20.0,
-  "min_ev": 0.1,
+  "min_ev": 0.05,
   "max_price": 0.45,
-  "min_volume": 500,
+  "min_volume": 2000,
   "min_hours": 2.0,
   "max_hours": 72.0,
   "kelly_fraction": 0.25,
+  "max_slippage": 0.03,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "vc_key": "YOUR_KEY_HERE",
-  "max_slippage": 0.03,
-  "poly_api_key": "YOUR_POLY_API_KEY_HERE",
-  "poly_secret": "YOUR_POLY_SECRET_HERE",
-  "poly_passphrase": "YOUR_POLY_PASSPHRASE_HERE",
-  "take_profit_pct": null
+  "vc_key": "YOUR_VISUAL_CROSSING_KEY",
+  "poly_signature_type": 1,
+  "poly_funder": "0xYOUR_PROXY_FUNDER"
 }
 ```
 
-`config.local.json` example:
-```json
-{
-  "vc_key": "REAL_VISUAL_CROSSING_KEY",
-  "poly_api_key": "REAL_POLY_API_KEY",
-  "poly_secret": "REAL_POLY_SECRET",
-  "poly_passphrase": "REAL_POLY_PASSPHRASE"
-}
+Get a free Visual Crossing API key at visualcrossing.com — used to fetch actual temperatures after market resolution.
+
+For live trading, keep wallet/CLOB secrets in environment variables (not in `config.json`):
+```bash
+export POLY_PRIVATE_KEY="0x..."
+export POLY_FUNDER="0x..."                # required in proxy mode (signature_type=1)
+export POLY_SIGNATURE_TYPE="1"            # proxy wallet mode default
+# Optional: if omitted, creds are derived at runtime
+export POLY_API_KEY="..."
+export POLY_SECRET="..."
+export POLY_PASSPHRASE="..."
 ```
 
-Environment variables override both files:
-`VC_KEY`, `POLY_API_KEY`, `POLY_SECRET`, `POLY_PASSPHRASE`.
+### Live trading from `vars.json`
+
+If you keep secrets in a local `vars.json` file (same folder as the bot), generate the exports the bot expects:
+
+```bash
+# Load into the current shell (bash/zsh)
+eval "$(python3 load_live_env.py)"
+
+# Or point at a custom path
+eval "$(python3 load_live_env.py /path/to/vars.json)"
+```
+
+Field names `load_live_env.py` accepts (see script docstring): `private_key`, `proxy_key`, `POLY_API_KEY` / `API_KEY`, `POLY_SECRET` / `SECRET`, `POLY_PASSPHRASE` / `Passphrase`, `vc_key` / `VC_KEY` (Visual Crossing), and `signature_type` (`proxy` → `1`).
+
+Validate that required values are present (exits 1 if not):
+
+```bash
+python3 load_live_env.py --check
+```
+
+**Do not commit `vars.json`** — it contains keys. Add it to `.gitignore` locally or keep it outside the repo.
 
 ---
 
 ## Usage
 ```bash
-python bot_v2.py run        # start the bot — scans every hour
-python bot_v2.py status     # balance and open positions
-python bot_v2.py report     # report + extended metrics
-python bot_v2.py close-all  # manually close all open positions
-```
-
-Dashboard JSON export:
-```bash
-python export_simulation_json.py
+python weatherbet.py preflight  # required before enabling live mode
+python weatherbet.py           # start the bot — scans every hour
+python weatherbet.py status    # balance and open positions
+python weatherbet.py report    # full breakdown of all resolved markets
+python weatherbet.py close-all # manual close attempt for all open positions
 ```
 
 ---
@@ -148,5 +162,3 @@ This data is used for self-calibration — the bot learns forecast accuracy per 
 ## Disclaimer
 
 This is not financial advice. Prediction markets carry real risk. Run the simulation thoroughly before committing real capital.
-
-Never commit real API keys, secrets, passphrases, or private keys to git.

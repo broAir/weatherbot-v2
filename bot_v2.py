@@ -10,46 +10,72 @@ Usage:
     python weatherbet.py          # main loop
     python weatherbet.py report   # full report
     python weatherbet.py status   # balance and open positions
+    python weatherbet.py preflight  # live trading readiness checks
 """
 
 import re
+import os
 import sys
 import json
 import math
 import time
-import os
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+
+from notify import imessage, imessage_error
+
+
+# ------------------------- stdout/stderr tee to bot.log ----------------------
+# Writes every print (and stderr) both to the console and to a persistent log
+# file so cron / launchd / nohup runs leave a trail. Install lazily — only when
+# the script is run as __main__, so importing this module in tests is clean.
+class _Tee:
+    def __init__(self, path, stream):
+        try:
+            self._f = open(path, "a", buffering=1, encoding="utf-8")
+        except Exception:
+            self._f = None
+        self._stream = stream
+
+    def write(self, s):
+        try:
+            self._stream.write(s)
+        except Exception:
+            pass
+        if self._f is not None:
+            try:
+                self._f.write(s)
+            except Exception:
+                pass
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        if self._f is not None:
+            try:
+                self._f.flush()
+            except Exception:
+                pass
+
+
+def _install_log_tee():
+    try:
+        log_path = Path("/Users/eilrvhc/weatherbot/bot.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stdout = _Tee(str(log_path), sys.stdout)
+        sys.stderr = _Tee(str(log_path), sys.stderr)
+    except Exception:
+        pass
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-def _load_config():
-    cfg = {}
-    config_path = Path("config.json")
-    local_path = Path("config.local.json")
-
-    if config_path.exists():
-        with open(config_path, encoding="utf-8") as f:
-            cfg.update(json.load(f))
-    if local_path.exists():
-        with open(local_path, encoding="utf-8") as f:
-            cfg.update(json.load(f))
-
-    env_overrides = {
-        "vc_key": os.environ.get("VC_KEY", "").strip(),
-        "poly_api_key": os.environ.get("POLY_API_KEY", "").strip(),
-        "poly_secret": os.environ.get("POLY_SECRET", "").strip(),
-        "poly_passphrase": os.environ.get("POLY_PASSPHRASE", "").strip(),
-    }
-    for key, value in env_overrides.items():
-        if value:
-            cfg[key] = value
-    return cfg
-
-_cfg = _load_config()
+with open("config.json", encoding="utf-8") as f:
+    _cfg = json.load(f)
 
 BALANCE          = _cfg.get("balance", 10000.0)
 MAX_BET          = _cfg.get("max_bet", 20.0)        # max bet per trade
@@ -62,11 +88,11 @@ KELLY_FRACTION   = _cfg.get("kelly_fraction", 0.25)
 MAX_SLIPPAGE     = _cfg.get("max_slippage", 0.03)  # max allowed ask-bid spread
 SCAN_INTERVAL    = _cfg.get("scan_interval", 3600)   # every hour
 CALIBRATION_MIN  = _cfg.get("calibration_min", 30)
-VC_KEY           = _cfg.get("vc_key", "")
-POLY_API_KEY     = _cfg.get("poly_api_key", "")
-POLY_SECRET      = _cfg.get("poly_secret", "")
-POLY_PASSPHRASE  = _cfg.get("poly_passphrase", "")
+VC_KEY           = (os.environ.get("VC_KEY") or _cfg.get("vc_key", "")).strip()
 TAKE_PROFIT_PCT  = _cfg.get("take_profit_pct", None)
+LIVE_TRADING     = _cfg.get("live_trading", False)
+POLY_SIGNATURE_TYPE = int(_cfg.get("poly_signature_type", 1))
+POLY_FUNDER_DEFAULT = _cfg.get("poly_funder", "")
 
 SIGMA_F = 2.0
 SIGMA_C = 1.2
@@ -116,6 +142,13 @@ TIMEZONES = {
 
 MONTHS = ["january","february","march","april","may","june",
           "july","august","september","october","november","december"]
+
+CLOB_HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137
+
+_CLOB_CLIENT = None
+_CLOB_CLIENT_FP = None
+_CLOB_CREDS_SOURCE = "none"
 
 # =============================================================================
 # MATH
@@ -318,6 +351,333 @@ def check_market_resolved(market_id):
 # =============================================================================
 # POLYMARKET
 # =============================================================================
+
+def _env_str(name, default=""):
+    return str(os.environ.get(name, default)).strip()
+
+
+def _safe_int(value, default):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return default
+
+
+def get_live_runtime_config():
+    """Read all live-trading secrets/config from env (fail-closed defaults)."""
+    return {
+        "private_key": _env_str("POLY_PRIVATE_KEY"),
+        "api_key": _env_str("POLY_API_KEY"),
+        "api_secret": _env_str("POLY_SECRET"),
+        "api_passphrase": _env_str("POLY_PASSPHRASE"),
+        "funder": _env_str("POLY_FUNDER", POLY_FUNDER_DEFAULT),
+        "signature_type": _safe_int(_env_str("POLY_SIGNATURE_TYPE", str(POLY_SIGNATURE_TYPE)), POLY_SIGNATURE_TYPE),
+    }
+
+
+def _parse_list_field(raw):
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return parsed
+        except Exception:
+            return []
+    return []
+
+
+def resolve_yes_token_id(market_payload):
+    """Extract token id for YES outcome from Gamma market payload."""
+    if not isinstance(market_payload, dict):
+        return None
+    token_ids = _parse_list_field(market_payload.get("clobTokenIds"))
+    if not token_ids:
+        return None
+    outcomes = _parse_list_field(market_payload.get("outcomes"))
+    if outcomes:
+        for idx, outcome in enumerate(outcomes):
+            if str(outcome).strip().lower() == "yes" and idx < len(token_ids):
+                return str(token_ids[idx])
+    return str(token_ids[0])
+
+
+def get_market_payload(market_id):
+    try:
+        r = requests.get(f"https://gamma-api.polymarket.com/markets/{market_id}", timeout=(3, 5))
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def resolve_token_id_for_market(market_id, all_outcomes=None, event_markets=None):
+    mid = str(market_id)
+    if isinstance(all_outcomes, list):
+        for outcome in all_outcomes:
+            if str(outcome.get("market_id")) == mid and outcome.get("token_id"):
+                return str(outcome["token_id"])
+    if isinstance(event_markets, list):
+        for market in event_markets:
+            if str(market.get("id")) == mid:
+                return resolve_yes_token_id(market)
+    payload = get_market_payload(mid)
+    return resolve_yes_token_id(payload) if payload else None
+
+
+def ensure_position_token_id(mkt, pos, outcomes=None):
+    token_id = pos.get("token_id")
+    if token_id:
+        return str(token_id)
+    market_id = pos.get("market_id")
+    if not market_id:
+        return None
+    token_id = resolve_token_id_for_market(
+        market_id=market_id,
+        all_outcomes=outcomes if isinstance(outcomes, list) else mkt.get("all_outcomes"),
+    )
+    if token_id:
+        pos["token_id"] = str(token_id)
+    return token_id
+
+
+def backfill_market_position_token(mkt):
+    pos = mkt.get("position")
+    if not pos or pos.get("status") != "open":
+        return False
+    token_before = pos.get("token_id")
+    token_after = ensure_position_token_id(mkt, pos)
+    return bool((not token_before) and token_after)
+
+
+def backfill_open_position_tokens():
+    repaired = 0
+    checked = 0
+    for mkt in load_all_markets():
+        pos = mkt.get("position")
+        if not pos or pos.get("status") != "open":
+            continue
+        checked += 1
+        if backfill_market_position_token(mkt):
+            save_market(mkt)
+            repaired += 1
+    return repaired, checked
+
+
+def _client_fingerprint(cfg):
+    return (
+        cfg.get("private_key"),
+        cfg.get("api_key"),
+        cfg.get("api_secret"),
+        cfg.get("api_passphrase"),
+        cfg.get("funder"),
+        cfg.get("signature_type"),
+    )
+
+
+def _configure_l2_creds(client, cfg):
+    from py_clob_client.clob_types import ApiCreds
+
+    api_key = cfg.get("api_key", "")
+    api_secret = cfg.get("api_secret", "")
+    api_passphrase = cfg.get("api_passphrase", "")
+    supplied = [bool(api_key), bool(api_secret), bool(api_passphrase)]
+    if any(supplied) and not all(supplied):
+        raise RuntimeError("POLY_API_KEY, POLY_SECRET, and POLY_PASSPHRASE must be set together")
+
+    if all(supplied):
+        client.set_api_creds(
+            ApiCreds(
+                api_key=api_key,
+                api_secret=api_secret,
+                api_passphrase=api_passphrase,
+            )
+        )
+        return "env"
+
+    creds = client.create_or_derive_api_creds()
+    if creds is None:
+        raise RuntimeError("could not derive/create CLOB API credentials")
+    client.set_api_creds(creds)
+    return "derived"
+
+
+def get_clob_client(require_l2=True):
+    """Get a cached CLOB client configured for proxy wallet L2 auth."""
+    global _CLOB_CLIENT, _CLOB_CLIENT_FP, _CLOB_CREDS_SOURCE
+    from py_clob_client.client import ClobClient
+
+    cfg = get_live_runtime_config()
+    fp = _client_fingerprint(cfg)
+
+    if _CLOB_CLIENT is not None and _CLOB_CLIENT_FP == fp:
+        if require_l2 and _CLOB_CREDS_SOURCE == "none":
+            _CLOB_CREDS_SOURCE = _configure_l2_creds(_CLOB_CLIENT, cfg)
+        return _CLOB_CLIENT
+
+    if not cfg["private_key"]:
+        raise RuntimeError("POLY_PRIVATE_KEY is required for live trading")
+
+    client = ClobClient(
+        host=CLOB_HOST,
+        chain_id=CHAIN_ID,
+        key=cfg["private_key"],
+        signature_type=cfg["signature_type"],
+        funder=cfg["funder"] or None,
+    )
+    creds_source = "none"
+    if require_l2:
+        creds_source = _configure_l2_creds(client, cfg)
+
+    _CLOB_CLIENT = client
+    _CLOB_CLIENT_FP = fp
+    _CLOB_CREDS_SOURCE = creds_source
+    return _CLOB_CLIENT
+
+
+def _extract_order_payload(raw):
+    if isinstance(raw, dict):
+        for key in ("order", "data"):
+            if isinstance(raw.get(key), dict):
+                return raw[key]
+        if isinstance(raw.get("orders"), list) and raw["orders"]:
+            if isinstance(raw["orders"][0], dict):
+                return raw["orders"][0]
+        return raw
+    if isinstance(raw, list) and raw and isinstance(raw[0], dict):
+        return raw[0]
+    return {}
+
+
+def _extract_float(payload, keys, default=0.0):
+    for key in keys:
+        if key in payload and payload.get(key) is not None:
+            try:
+                return float(payload[key])
+            except Exception:
+                continue
+    return default
+
+
+def execute_live_order(side, token_id, price, shares, reason):
+    """Submit order and verify it is fully filled before local ledger mutation."""
+    from py_clob_client.order_builder.constants import BUY, SELL
+    from py_clob_client.clob_types import MarketOrderArgs, OrderType
+
+    result = {
+        "ok": False,
+        "accepted": False,
+        "filled": False,
+        "order_id": None,
+        "status": "error",
+        "filled_shares": 0.0,
+        "requested_shares": float(shares),
+        "error": None,
+        "reason": reason,
+    }
+
+    try:
+        client = get_clob_client(require_l2=True)
+        # For BUY: amount=USDC to spend (library rounds to 2 decimal places)
+        # For SELL: amount=shares to sell
+        _side = BUY if side == "BUY" else SELL
+        _amount = round(float(price) * float(shares), 2) if side == "BUY" else float(shares)
+        order_args = MarketOrderArgs(
+            token_id=str(token_id),
+            amount=_amount,
+            price=round(float(price), 4),
+            side=_side,
+        )
+        order = client.create_market_order(order_args)
+        post_resp = client.post_order(order, orderType=OrderType.FOK)
+        post_payload = _extract_order_payload(post_resp)
+        order_id = post_payload.get("orderID") or post_payload.get("id")
+        result["order_id"] = str(order_id) if order_id else None
+        if not order_id:
+            result["status"] = "rejected"
+            result["error"] = "missing order id in post response"
+            return result
+
+        result["accepted"] = True
+        order_raw = client.get_order(order_id)
+        order_payload = _extract_order_payload(order_raw)
+        status = str(
+            order_payload.get("status")
+            or order_payload.get("state")
+            or post_payload.get("status")
+            or "unknown"
+        ).lower()
+        filled_shares = _extract_float(
+            order_payload,
+            ["sizeMatched", "size_matched", "filledSize", "filled_size", "matched"],
+            0.0,
+        )
+        if filled_shares == 0.0 and status in {"filled", "matched", "executed"}:
+            filled_shares = float(shares)
+
+        is_filled = filled_shares >= (float(shares) * 0.999)
+        result["filled_shares"] = round(filled_shares, 6)
+        result["filled"] = bool(is_filled)
+        result["ok"] = bool(is_filled)
+        result["status"] = "filled" if is_filled else status
+        if not is_filled:
+            result["error"] = f"order not fully filled (status={status}, filled={filled_shares:.4f})"
+        return result
+    except Exception as e:
+        result["status"] = "error"
+        result["error"] = str(e)
+        return result
+
+
+def execute_live_entry_if_needed(mkt, best_signal, event_markets=None, outcomes=None):
+    if not LIVE_TRADING:
+        return {"ok": True, "filled": True, "status": "paper", "order_id": None, "error": None}
+
+    token_id = best_signal.get("token_id")
+    if not token_id:
+        token_id = resolve_token_id_for_market(
+            market_id=best_signal.get("market_id"),
+            all_outcomes=outcomes if isinstance(outcomes, list) else mkt.get("all_outcomes"),
+            event_markets=event_markets,
+        )
+    if not token_id:
+        return {"ok": False, "filled": False, "status": "missing_token", "order_id": None, "error": "No token_id"}
+
+    best_signal["token_id"] = str(token_id)
+    result = execute_live_order(
+        side="BUY",
+        token_id=token_id,
+        price=best_signal["entry_price"],
+        shares=best_signal["shares"],
+        reason="entry",
+    )
+    best_signal["entry_order_id"] = result.get("order_id")
+    best_signal["last_order_status"] = result.get("status")
+    best_signal["last_order_error"] = result.get("error")
+    return result
+
+
+def execute_live_exit_if_needed(mkt, pos, current_price, reason, outcomes=None):
+    if not LIVE_TRADING:
+        return {"ok": True, "filled": True, "status": "paper", "order_id": None, "error": None}
+
+    token_id = ensure_position_token_id(mkt, pos, outcomes=outcomes)
+    if not token_id:
+        pos["last_order_status"] = "missing_token"
+        pos["last_order_error"] = "No token_id"
+        return {"ok": False, "filled": False, "status": "missing_token", "order_id": None, "error": "No token_id"}
+
+    result = execute_live_order(
+        side="SELL",
+        token_id=token_id,
+        price=current_price,
+        shares=pos["shares"],
+        reason=reason,
+    )
+    pos["exit_order_id"] = result.get("order_id")
+    pos["last_order_status"] = result.get("status")
+    pos["last_order_error"] = result.get("error")
+    return result
 
 def get_polymarket_event(city_slug, month, day, year):
     slug = f"highest-temperature-in-{city_slug}-on-{month}-{day}-{year}"
@@ -526,6 +886,7 @@ def scan_and_update():
                     ask = float(prices[1]) if len(prices) > 1 else bid
                 except Exception:
                     continue
+                token_id = resolve_yes_token_id(market)
                 outcomes.append({
                     "question":  question,
                     "market_id": mid,
@@ -535,6 +896,7 @@ def scan_and_update():
                     "price":     round(bid, 4),   # for compatibility
                     "spread":    round(ask - bid, 4),
                     "volume":    round(volume, 0),
+                    "token_id":  token_id,
                 })
 
             outcomes.sort(key=lambda x: x["range"][0])
@@ -587,10 +949,24 @@ def scan_and_update():
 
                     # Check stop
                     if current_price <= stop:
+                        close_reason = "stop_loss" if current_price < entry else "trailing_stop"
+                        live_result = execute_live_exit_if_needed(
+                            mkt=mkt,
+                            pos=pos,
+                            current_price=current_price,
+                            reason=close_reason,
+                            outcomes=outcomes,
+                        )
+                        if LIVE_TRADING and not live_result.get("filled"):
+                            print(
+                                f"  [HOLD] {loc['name']} {date} stop hit but SELL not filled "
+                                f"({live_result.get('status')}): {live_result.get('error')}"
+                            )
+                            continue
                         pnl = round((current_price - entry) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         pos["closed_at"]    = snap.get("ts")
-                        pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
+                        pos["close_reason"] = close_reason
                         pos["exit_price"]   = current_price
                         pos["pnl"]          = pnl
                         pos["status"]       = "closed"
@@ -615,6 +991,19 @@ def scan_and_update():
                             current_price = o["price"]
                             break
                     if current_price is not None:
+                        live_result = execute_live_exit_if_needed(
+                            mkt=mkt,
+                            pos=pos,
+                            current_price=current_price,
+                            reason="forecast_changed",
+                            outcomes=outcomes,
+                        )
+                        if LIVE_TRADING and not live_result.get("filled"):
+                            print(
+                                f"  [HOLD] {loc['name']} {date} forecast changed but SELL not filled "
+                                f"({live_result.get('status')}): {live_result.get('error')}"
+                            )
+                            continue
                         pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         mkt["position"]["closed_at"]    = snap.get("ts")
@@ -677,6 +1066,11 @@ def scan_and_update():
                                     "exit_price":   None,
                                     "close_reason": None,
                                     "closed_at":    None,
+                                    "token_id":     o.get("token_id"),
+                                    "entry_order_id": None,
+                                    "exit_order_id": None,
+                                    "last_order_status": None,
+                                    "last_order_error": None,
                                 }
 
                 if best_signal:
@@ -702,6 +1096,19 @@ def scan_and_update():
                         print(f"  [WARN] Could not fetch real ask for {best_signal['market_id']}: {e}")
 
                     if not skip_position and best_signal["entry_price"] < MAX_PRICE:
+                        entry_result = execute_live_entry_if_needed(
+                            mkt=mkt,
+                            best_signal=best_signal,
+                            event_markets=event.get("markets", []),
+                            outcomes=outcomes,
+                        )
+                        if LIVE_TRADING and not entry_result.get("filled"):
+                            print(
+                                f"  [SKIP] Live BUY not filled for {best_signal['market_id']} "
+                                f"({entry_result.get('status')}): {entry_result.get('error')}"
+                            )
+                            save_market(mkt)
+                            continue
                         balance -= best_signal["cost"]
                         mkt["position"] = best_signal
                         state["total_trades"] += 1
@@ -714,6 +1121,14 @@ def scan_and_update():
                             "BUY", mkt["city"], bucket_label, best_signal["entry_price"],
                             None, best_signal["cost"], None, None, balance, best_signal["forecast_src"]
                         )
+                        try:
+                            imessage(
+                                f"[OPEN] {loc['name']} {horizon} {date} | {bucket_label} "
+                                f"@ ${best_signal['entry_price']:.3f} | EV {best_signal['ev']:+.2f} "
+                                f"| ${best_signal['cost']:.2f} ({best_signal['forecast_src'].upper()})"
+                            )
+                        except Exception:
+                            pass
 
             # Market closed by time
             if hours < 0.5 and mkt["status"] == "open":
@@ -772,6 +1187,13 @@ def scan_and_update():
             "SELL", mkt["city"], bucket_label, pos["entry_price"],
             pos["exit_price"], pos["cost"], pnl, "resolved", balance, pos.get("forecast_src", "unknown")
         )
+        try:
+            imessage(
+                f"[{result}] {mkt['city_name']} {mkt['date']} | {bucket_label} "
+                f"| PnL: {'+' if pnl >= 0 else ''}{pnl:.2f} | bal ${balance:,.2f}"
+            )
+        except Exception:
+            pass
 
         save_market(mkt)
         time.sleep(0.3)
@@ -1024,10 +1446,14 @@ def monitor_positions():
         # Take-profit threshold: configurable percentage or hours-based
         take_profit = None
         if TAKE_PROFIT_PCT is not None:
-            # Percentage-based: close when gain % is reached
+            # Ride until 99%+ gain, then exit on 10% dip from peak
             gain_pct = ((current_price - entry) / entry * 100) if entry > 0 else 0
-            if gain_pct >= TAKE_PROFIT_PCT:
-                take_profit = current_price  # trigger immediately
+            peak_price = pos.get("peak_price", entry)
+            if current_price > peak_price:
+                pos["peak_price"] = current_price
+                peak_price = current_price
+            if gain_pct >= TAKE_PROFIT_PCT and current_price <= peak_price * 0.90:
+                take_profit = current_price  # close on 10% reversal from peak
         else:
             # Hours-based (original logic)
             if hours_left < 24:
@@ -1049,23 +1475,46 @@ def monitor_positions():
         stop_triggered = current_price <= stop
 
         if take_triggered or stop_triggered:
+            close_reason = "take_profit" if take_triggered else ("stop_loss" if current_price < entry else "trailing_stop")
+            live_result = execute_live_exit_if_needed(
+                mkt=mkt,
+                pos=pos,
+                current_price=current_price,
+                reason=close_reason,
+                outcomes=mkt.get("all_outcomes", []),
+            )
+            if LIVE_TRADING and not live_result.get("filled"):
+                print(
+                    f"  [HOLD] {city_name} {mkt['date']} exit trigger but SELL not filled "
+                    f"({live_result.get('status')}): {live_result.get('error')}"
+                )
+                save_market(mkt)
+                continue
             pnl = round((current_price - entry) * pos["shares"], 2)
             balance += pos["cost"] + pnl
             pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
             if take_triggered:
-                pos["close_reason"] = "take_profit"
+                pos["close_reason"] = close_reason
                 reason = "TAKE"
             elif current_price < entry:
-                pos["close_reason"] = "stop_loss"
+                pos["close_reason"] = close_reason
                 reason = "STOP"
             else:
-                pos["close_reason"] = "trailing_stop"
+                pos["close_reason"] = close_reason
                 reason = "TRAILING BE"
             pos["exit_price"]   = current_price
             pos["pnl"]          = pnl
             pos["status"]       = "closed"
             closed += 1
             print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+            try:
+                imessage(
+                    f"[{reason}] {city_name} {mkt['date']} "
+                    f"| entry ${entry:.3f} → ${current_price:.3f} "
+                    f"| PnL: {'+' if pnl >= 0 else ''}{pnl:.2f} | bal ${balance:,.2f}"
+                )
+            except Exception:
+                pass
             save_market(mkt)
 
     if closed:
@@ -1075,25 +1524,254 @@ def monitor_positions():
     return closed
 
 
+def send_daily_summary_if_due():
+    """Send at most one iMessage daily-summary per calendar day.
+
+    Uses state['last_summary_date'] as a cursor. On first run just stamps
+    today and skips sending. On subsequent day rollovers, tallies SELL rows
+    in data/trades_log.csv between the last cursor date (inclusive) and
+    today (exclusive), then advances the cursor.
+    """
+    try:
+        state = load_state()
+    except Exception:
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    last = state.get("last_summary_date")
+    if last == today:
+        return
+    if not last:
+        state["last_summary_date"] = today
+        try:
+            save_state(state)
+        except Exception:
+            pass
+        return
+
+    trades = 0
+    pnl_sum = 0.0
+    csv_path = DATA_DIR / "trades_log.csv"
+    try:
+        if csv_path.exists():
+            with open(csv_path, encoding="utf-8") as f:
+                next(f, None)  # header
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) < 8 or parts[1] != "SELL":
+                        continue
+                    d = parts[0][:10]
+                    if last <= d < today:
+                        trades += 1
+                        try:
+                            pnl_sum += float(parts[7])
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    bal = state.get("balance", 0.0)
+    try:
+        imessage(
+            f"[DAILY {last}] trades: {trades} "
+            f"| P&L: {'+' if pnl_sum >= 0 else ''}{pnl_sum:.2f} "
+            f"| bal: ${bal:,.2f}"
+        )
+    except Exception:
+        pass
+
+    state["last_summary_date"] = today
+    try:
+        save_state(state)
+    except Exception:
+        pass
+
+
+def _is_hex_address(value):
+    return bool(re.fullmatch(r"0x[a-fA-F0-9]{40}", str(value or "").strip()))
+
+
+def _count_missing_open_tokens():
+    missing = 0
+    total = 0
+    for mkt in load_all_markets():
+        pos = mkt.get("position")
+        if not pos or pos.get("status") != "open":
+            continue
+        total += 1
+        if not pos.get("token_id"):
+            missing += 1
+    return missing, total
+
+
+def _find_sample_market_and_token():
+    for mkt in load_all_markets():
+        pos = mkt.get("position")
+        if not pos:
+            continue
+        mid = pos.get("market_id")
+        token = pos.get("token_id") or resolve_token_id_for_market(mid, all_outcomes=mkt.get("all_outcomes", []))
+        if mid and token:
+            return str(mid), str(token)
+
+    now = datetime.now(timezone.utc) + timedelta(days=1)
+    event = get_polymarket_event("nyc", MONTHS[now.month - 1], now.day, now.year)
+    if event:
+        markets = event.get("markets", [])
+        if markets:
+            mid = markets[0].get("id")
+            token = resolve_yes_token_id(markets[0])
+            if mid and token:
+                return str(mid), str(token)
+    return None, None
+
+
+def run_preflight():
+    print(f"\n{'='*55}")
+    print("  WEATHERBET — PREFLIGHT")
+    print(f"{'='*55}")
+    checks = []
+
+    def _record(ok, name, details=""):
+        checks.append(bool(ok))
+        status = "OK" if ok else "FAIL"
+        suffix = f" | {details}" if details else ""
+        print(f"  [{status}] {name}{suffix}")
+
+    # Dependencies
+    deps_ok = True
+    dep_err = None
+    try:
+        import py_clob_client  # noqa: F401
+        from eth_account import Account  # noqa: F401
+    except Exception as e:
+        deps_ok = False
+        dep_err = str(e)
+    _record(deps_ok, "Python dependencies", dep_err or "py_clob_client + eth_account")
+
+    cfg = get_live_runtime_config()
+
+    # Required env vars
+    required_ok = bool(cfg["private_key"])
+    details = "POLY_PRIVATE_KEY present" if required_ok else "missing POLY_PRIVATE_KEY"
+    _record(required_ok, "Required env vars", details)
+
+    # Wallet / proxy validation
+    wallet_ok = False
+    wallet_details = ""
+    signer_addr = None
+    if deps_ok and cfg["private_key"]:
+        try:
+            from eth_account import Account
+            signer_addr = Account.from_key(cfg["private_key"]).address
+            wallet_ok = True
+            wallet_details = f"signer {signer_addr}"
+        except Exception as e:
+            wallet_ok = False
+            wallet_details = f"invalid POLY_PRIVATE_KEY: {e}"
+    else:
+        wallet_details = "skipped"
+    _record(wallet_ok, "Wallet key validation", wallet_details)
+
+    proxy_ok = True
+    proxy_details = f"signature_type={cfg['signature_type']}"
+    if cfg["signature_type"] == 1:
+        if not cfg["funder"]:
+            proxy_ok = False
+            proxy_details = "proxy mode requires POLY_FUNDER"
+        elif not _is_hex_address(cfg["funder"]):
+            proxy_ok = False
+            proxy_details = "POLY_FUNDER must be a 0x...40-hex address"
+        else:
+            proxy_details = f"proxy funder {cfg['funder']}"
+    _record(proxy_ok, "Proxy wallet settings", proxy_details)
+
+    # Backfill open tokens + check completeness
+    repaired, checked = backfill_open_position_tokens()
+    missing, total = _count_missing_open_tokens()
+    token_ok = (missing == 0)
+    _record(
+        token_ok,
+        "Open-position token IDs",
+        f"repaired {repaired}/{checked}, missing {missing}/{total}",
+    )
+
+    # L2 auth check
+    l2_ok = False
+    l2_details = "skipped"
+    if deps_ok and required_ok and wallet_ok and proxy_ok:
+        try:
+            client = get_clob_client(require_l2=True)
+            keys = client.get_api_keys()
+            key_count = len(keys) if isinstance(keys, list) else 1
+            l2_ok = True
+            l2_details = f"L2 auth OK ({_CLOB_CREDS_SOURCE} creds, keys={key_count})"
+        except Exception as e:
+            l2_ok = False
+            l2_details = str(e)
+    _record(l2_ok, "CLOB L2 authentication", l2_details)
+
+    # Dry quote fetch (Gamma + CLOB order book)
+    quote_ok = False
+    quote_details = "skipped"
+    if l2_ok:
+        market_id, token_id = _find_sample_market_and_token()
+        if market_id and token_id:
+            try:
+                payload = get_market_payload(market_id)
+                if not payload:
+                    raise RuntimeError("Gamma market fetch failed")
+                book = get_clob_client(require_l2=True).get_order_book(token_id)
+                bids = len(book.bids or [])
+                asks = len(book.asks or [])
+                quote_ok = True
+                quote_details = f"market {market_id}, token {token_id[:10]}..., bids={bids}, asks={asks}"
+            except Exception as e:
+                quote_ok = False
+                quote_details = str(e)
+        else:
+            quote_details = "no sample market/token found"
+    _record(quote_ok, "Dry quote fetch (Gamma+CLOB)", quote_details)
+
+    all_ok = all(checks)
+    print(f"\n  Result: {'PASS' if all_ok else 'FAIL'}")
+    print(f"{'='*55}\n")
+    return all_ok
+
+
 def run_loop():
     global _cal
     _cal = load_cal()
+    repaired, checked = backfill_open_position_tokens()
 
     print(f"\n{'='*55}")
     print(f"  WEATHERBET — STARTING")
     print(f"{'='*55}")
+    print(f"  Mode:       {'LIVE' if LIVE_TRADING else 'PAPER/SIM'}")
     print(f"  Cities:     {len(LOCATIONS)}")
     print(f"  Balance:    ${BALANCE:,.0f} | Max bet: ${MAX_BET}")
     print(f"  Scan:       {SCAN_INTERVAL//60} min | Monitor: {MONITOR_INTERVAL//60} min")
     print(f"  Sources:    ECMWF + HRRR(US) + METAR(D+0)")
     print(f"  Data:       {DATA_DIR.resolve()}")
+    if repaired:
+        print(f"  Token fix:  repaired {repaired}/{checked} open positions")
     print(f"  Ctrl+C to stop\n")
+
+    if LIVE_TRADING and not run_preflight():
+        print("  Live preflight failed. Exiting without placing orders.")
+        return
 
     last_full_scan = 0
 
     while True:
         now_ts  = time.time()
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Send daily summary once per calendar day (before the scan so errors
+        # in scan don't delay it).
+        try:
+            send_daily_summary_if_due()
+        except Exception:
+            pass
 
         # Full scan once per hour
         if now_ts - last_full_scan >= SCAN_INTERVAL:
@@ -1111,10 +1789,12 @@ def run_loop():
                 break
             except requests.exceptions.ConnectionError:
                 print(f"  Connection lost — waiting 60 sec")
+                imessage_error("[ERROR] weatherbot: connection lost — retrying in 60s")
                 time.sleep(60)
                 continue
             except Exception as e:
                 print(f"  Error: {e} — waiting 60 sec")
+                imessage_error(f"[ERROR] weatherbot scan: {e}")
                 time.sleep(60)
                 continue
         else:
@@ -1127,6 +1807,7 @@ def run_loop():
                     print(f"  balance: ${state['balance']:,.2f}")
             except Exception as e:
                 print(f"  Monitor error: {e}")
+                imessage_error(f"[ERROR] weatherbot monitor: {e}")
 
         try:
             time.sleep(MONITOR_INTERVAL)
@@ -1172,6 +1853,21 @@ def close_all_positions():
         except Exception:
             current_price = entry
 
+        live_result = execute_live_exit_if_needed(
+            mkt=mkt,
+            pos=pos,
+            current_price=current_price,
+            reason="manual",
+            outcomes=mkt.get("all_outcomes", []),
+        )
+        if LIVE_TRADING and not live_result.get("filled"):
+            print(
+                f"  {city:<16} {date} | {bucket:<15} | HOLD (SELL not filled: "
+                f"{live_result.get('status')}: {live_result.get('error')})"
+            )
+            save_market(mkt)
+            continue
+
         # Calculate PnL
         pnl = round((current_price - entry) * shares, 2)
         balance += cost + pnl
@@ -1216,11 +1912,20 @@ def close_all_positions():
     print(f"\n  Closed: {closed_count} | Realized PnL: {total_realized_pnl:+.2f} | New Balance: ${balance:,.2f}")
     print(f"{'='*55}\n")
 
+    try:
+        imessage(
+            f"[CLOSE-ALL] closed: {closed_count} "
+            f"| realized PnL: {total_realized_pnl:+.2f} | bal ${balance:,.2f}"
+        )
+    except Exception:
+        pass
+
 # =============================================================================
 # CLI
 # =============================================================================
 
 if __name__ == "__main__":
+    _install_log_tee()
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "run":
         run_loop()
@@ -1231,7 +1936,10 @@ if __name__ == "__main__":
         _cal = load_cal()
         print_report()
         print_extended_report()
+    elif cmd == "preflight":
+        ok = run_preflight()
+        sys.exit(0 if ok else 1)
     elif cmd == "close-all":
         close_all_positions()
     else:
-        print("Usage: python weatherbet.py [run|status|report|close-all]")
+        print("Usage: python weatherbet.py [run|status|report|preflight|close-all]")

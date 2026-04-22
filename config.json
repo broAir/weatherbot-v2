@@ -1,6 +1,6 @@
 {
-  "balance": 10000.0,
-  "max_bet": 20.0,
+  "balance": 15.34,
+  "max_bet": 10.0,
   "min_ev": 0.1,
   "max_price": 0.45,
   "min_volume": 500,
@@ -9,10 +9,9 @@
   "kelly_fraction": 0.25,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "vc_key": "YOUR_KEY_HERE",
   "max_slippage": 0.03,
-  "poly_api_key": "YOUR_POLY_API_KEY_HERE",
-  "poly_secret": "YOUR_POLY_SECRET_HERE",
-  "poly_passphrase": "YOUR_POLY_PASSPHRASE_HERE",
-  "take_profit_pct": null
+  "poly_signature_type": 1,
+  "poly_funder": "",
+  "take_profit_pct": 99.0,
+  "live_trading": true
 }
