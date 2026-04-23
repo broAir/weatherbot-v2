@@ -13,7 +13,7 @@ The foundation. Scans 6 US cities, fetches forecasts from NWS using airport stat
 
 No math, no complexity. Just the core logic — good for understanding how the system works.
 
-### `bot_v2.py` — Full Bot (current)
+### `weatherbet.py` — Full Bot (current)
 Everything in v1, plus:
 - **20 cities** across 4 continents (US, Europe, Asia, South America, Oceania)
 - **3 forecast sources** — ECMWF (global), HRRR/GFS (US, hourly), METAR (real-time observations)
@@ -65,16 +65,7 @@ Every Polymarket weather market resolves on a specific airport station. NYC reso
 ```bash
 git clone https://github.com/alteregoeth-ai/weatherbot
 cd weatherbot
-chmod +x run.sh
-```
-
-`run.sh` is the recommended entrypoint. It loads env vars from `vars.json`, uses `.venv/bin/python`, and auto-repairs/recreates `.venv` if the interpreter link is broken.
-
-If you want to prepare the venv manually:
-
-```bash
-python3 -m venv .venv
-.venv/bin/pip install requests py-clob-client eth-account
+pip install requests
 ```
 
 Create `config.json` in the project folder:
@@ -91,93 +82,41 @@ Create `config.json` in the project folder:
   "max_slippage": 0.03,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "vc_key": "YOUR_VISUAL_CROSSING_KEY",
-  "poly_signature_type": 1,
-  "poly_funder": "0xYOUR_PROXY_FUNDER"
+  "vc_key": "YOUR_VISUAL_CROSSING_KEY"
 }
 ```
 
 Get a free Visual Crossing API key at visualcrossing.com — used to fetch actual temperatures after market resolution.
 
-For live trading, keep wallet/CLOB secrets in environment variables (not in `config.json`):
-```bash
-export POLY_PRIVATE_KEY="0x..."
-export POLY_FUNDER="0x..."                # required in proxy mode (signature_type=1)
-export POLY_SIGNATURE_TYPE="1"            # proxy wallet mode default
-# Optional: if omitted, creds are derived at runtime
-export POLY_API_KEY="..."
-export POLY_SECRET="..."
-export POLY_PASSPHRASE="..."
-```
+### Live Trading Secrets (secure local setup)
 
-### Live trading from `vars.json`
-
-If you keep secrets in a local `vars.json` file (same folder as the bot), generate the exports the bot expects:
+Live credentials should be stored in macOS Keychain and loaded into environment variables at runtime.
+Do not put private keys or API secrets in `config.json`, code, commits, or terminal history.
 
 ```bash
-# Load into the current shell (bash/zsh)
-eval "$(python3 load_live_env.py)"
-
-# Or point at a custom path
-eval "$(python3 load_live_env.py /path/to/vars.json)"
+chmod 700 scripts/setup_live_secrets.sh scripts/load_live_env.sh
+./scripts/setup_live_secrets.sh
+source ./scripts/load_live_env.sh
 ```
 
-Field names `load_live_env.py` accepts (see script docstring): `private_key`, `proxy_key`, `POLY_API_KEY` / `API_KEY`, `POLY_SECRET` / `SECRET`, `POLY_PASSPHRASE` / `Passphrase`, `vc_key` / `VC_KEY` (Visual Crossing), and `signature_type` (`proxy` → `1`).
-
-Validate that required values are present (exits 1 if not):
-
-```bash
-python3 load_live_env.py --check
-```
-
-**Do not commit `vars.json`** — it contains keys. Add it to `.gitignore` locally or keep it outside the repo.
+Environment variables used by the bot:
+- `PRIVATE_KEY`
+- `CHAIN_ID`
+- `SIGNATURE_TYPE`
+- `PROXY_KEY`
+- `POLY_API_KEY`
+- `POLY_SECRET`
+- `POLY_PASSPHRASE`
 
 ---
 
 ## Usage
 ```bash
-./run.sh preflight   # required before enabling live mode
-./run.sh run         # start the bot — scans every hour
-./run.sh status      # balance and open positions
-./run.sh report      # full breakdown of all resolved markets
-./run.sh close-all   # manual close attempt for all open positions
+python weatherbet.py           # start the bot — scans every hour
+python weatherbet.py status    # balance and open positions
+python weatherbet.py report    # full breakdown of all resolved markets
+python weatherbet.py wallet    # live on-chain wallet balances (Polygon)
 ```
-
-Direct execution is also possible:
-
-```bash
-.venv/bin/python bot_v2.py [run|status|report|preflight|close-all]
-```
-
-### Notifications
-
-`notify` integration is no longer required. Runtime events/errors are shown in console output and written to `bot.log` via the internal tee logger.
-
----
-
-## Troubleshooting
-
-### `./run.sh: ... .venv/bin/python: No such file or directory`
-
-Cause: stale/broken `.venv` symlink (common after moving/copying the project between machines).
-
-Fix options:
-
-```bash
-# Recommended: let run.sh self-heal
-./run.sh status
-
-# Manual repair
-rm -rf .venv
-python3 -m venv .venv
-.venv/bin/pip install requests py-clob-client eth-account
-```
-
-### Preflight fails in live mode
-
-Most common causes are invalid wallet values:
-- `POLY_PRIVATE_KEY` must be valid hex private key.
-- `POLY_FUNDER` must be a `0x` + 40 hex chars address when proxy mode is enabled.
 
 ---
 

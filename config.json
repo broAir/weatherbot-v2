@@ -1,6 +1,6 @@
 {
-  "balance": 15.34,
-  "max_bet": 10.0,
+  "balance": 20.527167,
+  "max_bet": 2.0,
   "min_ev": 0.1,
   "max_price": 0.45,
   "min_volume": 500,
@@ -9,9 +9,6 @@
   "kelly_fraction": 0.25,
   "scan_interval": 3600,
   "calibration_min": 30,
-  "max_slippage": 0.03,
-  "poly_signature_type": 1,
-  "poly_funder": "",
-  "take_profit_pct": 99.0,
-  "live_trading": true
+  "vc_key": "YOUR_VISUAL_CROSSING_KEY",
+  "max_slippage": 0.03
 }
