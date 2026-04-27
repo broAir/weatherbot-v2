@@ -22,7 +22,7 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
 CLOB_BUY  = "BUY"
 CLOB_SELL = "SELL"
 
@@ -248,19 +248,35 @@ def get_clob():
         )
     return _clob
 
+def get_real_shares(clob, token_id):
+    """Query actual on-chain conditional token balance. Returns float shares or None."""
+    try:
+        params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        result = clob.get_balance_allowance(params)
+        raw = int(result.get("balance", 0))
+        return round(raw / 1e6, 4)
+    except Exception as e:
+        print(f"  [LIVE WARN] could not read on-chain shares: {e}")
+        return None
+
+def parse_balance_from_error(exc):
+    """Extract actual balance (in raw units) from a 'not enough balance' CLOB error."""
+    msg = str(getattr(exc, "error_msg", exc))
+    m = re.search(r"balance:\s*(\d+)", msg)
+    return int(m.group(1)) if m else None
+
 def place_live_buy(token_id, price, size_usdc):
+    """Returns False on failure, or actual on-chain shares (float) on success."""
     if not token_id:
         print("  [LIVE ERR] No token_id — cannot place buy")
         return False
     try:
         clob = get_clob()
-        limit_price = round(float(price), 4)
-        amount_usdc = round(float(size_usdc), 2)
         args = MarketOrderArgs(
             token_id=token_id,
-            amount=amount_usdc,
+            amount=round(float(size_usdc), 2),
             side=CLOB_BUY,
-            price=limit_price,
+            price=round(float(price), 4),
             order_type=OrderType.FOK,
         )
         signed = create_signed_market_order(clob, args)
@@ -269,7 +285,13 @@ def place_live_buy(token_id, price, size_usdc):
             print(f"  [LIVE ERR] Buy rejected: {resp}")
             return False
         print(f"  [LIVE] Buy placed — order {resp.get('orderID', '?')}")
-        return True
+        # Fix 1: query actual on-chain shares after settlement
+        time.sleep(2)
+        real = get_real_shares(clob, token_id)
+        if real is not None and real > 0:
+            print(f"  [LIVE] Actual shares received: {real}")
+            return real
+        return True  # success but couldn't read actual amount
     except Exception as e:
         if is_fok_not_filled_exception(e):
             print("  [LIVE SKIP] Buy not filled — FOK order was killed by available liquidity")
@@ -277,20 +299,33 @@ def place_live_buy(token_id, price, size_usdc):
         print(f"  [LIVE ERR] Buy exception: {e}")
         return False
 
+def _do_sell(clob, token_id, price, shares):
+    args = OrderArgs(price=round(float(price), 4), size=round(float(shares), 4), side=CLOB_SELL, token_id=token_id)
+    signed = create_signed_order(clob, args)
+    return post_live_order(clob, signed, OrderType.FOK, "Sell")
+
 def place_live_sell(token_id, price, shares):
+    """Returns False on failure, or (sold_shares, fill_price) tuple on success."""
     if not token_id:
         print("  [LIVE ERR] No token_id — cannot place sell")
         return False
     try:
         clob = get_clob()
-        args = OrderArgs(price=round(float(price), 4), size=round(float(shares), 4), side=CLOB_SELL, token_id=token_id)
-        signed = create_signed_order(clob, args)
-        resp = post_live_order(clob, signed, OrderType.FOK, "Sell")
+        sold_shares = float(shares)
+        try:
+            resp = _do_sell(clob, token_id, price, shares)
+        except Exception as e:
+            raw_balance = parse_balance_from_error(e)
+            if raw_balance is None or raw_balance <= 0:
+                raise
+            sold_shares = round(raw_balance / 1e6, 4)
+            print(f"  [LIVE] Sell failed for {shares} shares; retrying with on-chain {sold_shares}")
+            resp = _do_sell(clob, token_id, price, sold_shares)
         if not live_order_succeeded(resp):
             print(f"  [LIVE ERR] Sell rejected: {resp}")
             return False
-        print(f"  [LIVE] Sell placed — order {resp.get('orderID', '?')}")
-        return True
+        print(f"  [LIVE] Sell placed — order {resp.get('orderID', '?')} | sold {sold_shares} shares @ ${price:.3f}")
+        return (sold_shares, float(price))
     except Exception as e:
         if is_fok_not_filled_exception(e):
             print("  [LIVE SKIP] Sell not filled — FOK order was killed by available liquidity")
@@ -937,21 +972,31 @@ def scan_and_update():
                                 pos["trailing_activated"] = True
 
                             # Check stop
-                            if current_price <= stop:
+                            # Stop is conditional on forecast: only close if price hit stop AND forecast is out of bucket
+                            forecast_invalid = forecast_temp is None or not in_bucket(forecast_temp, pos["bucket_low"], pos["bucket_high"])
+                            if current_price <= stop and forecast_invalid:
                                 live_sell_ok = True
+                                actual_shares = pos["shares"]
+                                actual_price = current_price
                                 if LIVE_TRADING:
-                                    live_sell_ok = place_live_sell(pos.get("token_id"), current_price, pos["shares"])
+                                    sell_result = place_live_sell(pos.get("token_id"), current_price, pos["shares"])
+                                    if sell_result and isinstance(sell_result, tuple):
+                                        actual_shares, actual_price = sell_result
+                                    else:
+                                        live_sell_ok = bool(sell_result)
                                 if live_sell_ok:
-                                    pnl = round((current_price - entry) * pos["shares"], 2)
-                                    balance += pos["cost"] + pnl
+                                    proceeds = actual_shares * actual_price
+                                    pnl = round(proceeds - pos["cost"], 2)
+                                    balance += proceeds
                                     pos["closed_at"]    = snap.get("ts")
                                     pos["close_reason"] = "stop_loss" if current_price < entry else "trailing_stop"
-                                    pos["exit_price"]   = current_price
+                                    pos["exit_price"]   = actual_price
+                                    pos["sold_shares"]  = actual_shares
                                     pos["pnl"]          = pnl
                                     pos["status"]       = "closed"
                                     closed += 1
                                     reason = "STOP" if current_price < entry else "TRAILING BE"
-                                    print(f"  [{reason}] {loc['name']} [{product_kind}] {date} | entry ${entry:.3f} exit ${current_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                                    print(f"  [{reason}] {loc['name']} [{product_kind}] {date} | entry ${entry:.3f} exit ${actual_price:.3f} | sold {actual_shares} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                                 else:
                                     print(f"  [LIVE ERR] Stop close not recorded for {loc['name']} [{product_kind}] {date}")
 
@@ -972,23 +1017,91 @@ def scan_and_update():
                                     break
                             if current_price is not None:
                                 live_sell_ok = True
+                                actual_shares = pos["shares"]
+                                actual_price = current_price
                                 if LIVE_TRADING:
-                                    live_sell_ok = place_live_sell(pos.get("token_id"), current_price, pos["shares"])
+                                    sell_result = place_live_sell(pos.get("token_id"), current_price, pos["shares"])
+                                    if sell_result and isinstance(sell_result, tuple):
+                                        actual_shares, actual_price = sell_result
+                                    else:
+                                        live_sell_ok = bool(sell_result)
                                 if live_sell_ok:
-                                    pnl = round((current_price - pos["entry_price"]) * pos["shares"], 2)
-                                    balance += pos["cost"] + pnl
+                                    proceeds = actual_shares * actual_price
+                                    pnl = round(proceeds - pos["cost"], 2)
+                                    balance += proceeds
                                     mkt["position"]["closed_at"]    = snap.get("ts")
                                     mkt["position"]["close_reason"] = "forecast_changed"
-                                    mkt["position"]["exit_price"]   = current_price
+                                    mkt["position"]["exit_price"]   = actual_price
+                                    mkt["position"]["sold_shares"]  = actual_shares
                                     mkt["position"]["pnl"]          = pnl
                                     mkt["position"]["status"]       = "closed"
                                     closed += 1
-                                    print(f"  [CLOSE] {loc['name']} [{product_kind}] {date} — forecast changed | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                                    print(f"  [CLOSE] {loc['name']} [{product_kind}] {date} — forecast changed | sold {actual_shares} @ ${actual_price:.3f} | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
                                 else:
                                     print(f"  [LIVE ERR] Forecast-change close not recorded for {loc['name']} [{product_kind}] {date}")
 
+                    # --- CLOSE POSITION if market top bucket has diverged for 12+ hours ---
+                    if mkt.get("position") and outcomes and mkt["position"].get("status") == "open":
+                        pos = mkt["position"]
+                        my_bucket = (pos["bucket_low"], pos["bucket_high"])
+                        top = max(outcomes, key=lambda x: x["price"])
+                        top_bucket = (top["range"][0], top["range"][1])
+                        now_iso = datetime.now(timezone.utc).isoformat()
+                        if my_bucket != top_bucket:
+                            if not pos.get("top_divergence_start"):
+                                pos["top_divergence_start"] = now_iso
+                            else:
+                                started = datetime.fromisoformat(pos["top_divergence_start"])
+                                hours_diverged = (datetime.now(timezone.utc) - started).total_seconds() / 3600
+                                if hours_diverged >= 12.0:
+                                    current_price = None
+                                    for o in outcomes:
+                                        if o["market_id"] == pos["market_id"]:
+                                            current_price = o.get("bid", o["price"])
+                                            break
+                                    if current_price is not None:
+                                        live_sell_ok = True
+                                        actual_shares = pos["shares"]
+                                        actual_price = current_price
+                                        if LIVE_TRADING:
+                                            sell_result = place_live_sell(pos.get("token_id"), current_price, pos["shares"])
+                                            if sell_result and isinstance(sell_result, tuple):
+                                                actual_shares, actual_price = sell_result
+                                            else:
+                                                live_sell_ok = bool(sell_result)
+                                        if live_sell_ok:
+                                            proceeds = actual_shares * actual_price
+                                            pnl = round(proceeds - pos["cost"], 2)
+                                            balance += proceeds
+                                            pos["closed_at"]    = snap.get("ts")
+                                            pos["close_reason"] = "market_diverged_12h"
+                                            pos["exit_price"]   = actual_price
+                                            pos["sold_shares"]  = actual_shares
+                                            pos["pnl"]          = pnl
+                                            pos["status"]       = "closed"
+                                            closed += 1
+                                            print(f"  [DIVERGED] {loc['name']} [{product_kind}] {date} — market top {int(top_bucket[0])}-{int(top_bucket[1])} ≠ mine {int(my_bucket[0])}-{int(my_bucket[1])} for {hours_diverged:.1f}h | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+                                        else:
+                                            print(f"  [LIVE ERR] Divergence close not recorded for {loc['name']} [{product_kind}] {date}")
+                        else:
+                            if pos.get("top_divergence_start"):
+                                pos["top_divergence_start"] = None
+
                     # --- OPEN POSITION ---
-                    if not mkt.get("position") and forecast_temp is not None and hours >= MIN_HOURS:
+                    # Cooldown: if a position was closed in this market within the last 6h,
+                    # skip re-opening to avoid forecast-oscillation ping-pong.
+                    cooldown_ok = True
+                    prev = mkt.get("position")
+                    if prev and prev.get("status") == "closed" and prev.get("closed_at"):
+                        try:
+                            closed_at = datetime.fromisoformat(prev["closed_at"])
+                            hours_since_close = (datetime.now(timezone.utc) - closed_at).total_seconds() / 3600
+                            if hours_since_close < 6.0:
+                                cooldown_ok = False
+                        except Exception:
+                            pass
+                    can_open = (not mkt.get("position") or (mkt.get("position", {}).get("status") == "closed" and cooldown_ok))
+                    if can_open and forecast_temp is not None and hours >= MIN_HOURS:
                         sigma = get_sigma(city_slug, best_source or "ecmwf", product_kind=product_kind)
                         best_signal = None
 
@@ -1073,10 +1186,12 @@ def scan_and_update():
 
                             if not skip_position and best_signal["entry_price"] < MAX_PRICE:
                                 if LIVE_TRADING:
-                                    ok = place_live_buy(best_signal.get("token_id"), best_signal["entry_price"], best_signal["cost"])
-                                    if not ok:
+                                    result = place_live_buy(best_signal.get("token_id"), best_signal["entry_price"], best_signal["cost"])
+                                    if not result:
                                         print(f"  [LIVE ERR] Buy failed — skipping position")
                                         skip_position = True
+                                    elif isinstance(result, (int, float)) and not isinstance(result, bool):
+                                        best_signal["shares"] = result  # use real on-chain shares
                             if not skip_position and best_signal["entry_price"] < MAX_PRICE:
                                 balance -= best_signal["cost"]
                                 mkt["position"] = best_signal
@@ -1355,13 +1470,22 @@ def monitor_positions():
 
         # Check take-profit
         take_triggered = take_profit is not None and current_price >= take_profit
-        # Check stop
-        stop_triggered = current_price <= stop
+        # Check stop — only if forecast also says we're out of bucket
+        snaps = mkt.get("forecast_snapshots", [])
+        latest_forecast = snaps[-1].get("best") if snaps else None
+        forecast_invalid = latest_forecast is None or not in_bucket(latest_forecast, pos["bucket_low"], pos["bucket_high"])
+        stop_triggered = current_price <= stop and forecast_invalid
 
         if take_triggered or stop_triggered:
             live_sell_ok = True
+            actual_shares = pos["shares"]
+            actual_price = current_price
             if LIVE_TRADING:
-                live_sell_ok = place_live_sell(pos.get("token_id"), current_price, pos["shares"])
+                sell_result = place_live_sell(pos.get("token_id"), current_price, pos["shares"])
+                if sell_result and isinstance(sell_result, tuple):
+                    actual_shares, actual_price = sell_result
+                else:
+                    live_sell_ok = bool(sell_result)
             if not live_sell_ok:
                 print(f"  [LIVE ERR] Monitor close not recorded for {city_name} {mkt['date']}")
                 continue
@@ -1372,19 +1496,21 @@ def monitor_positions():
                 reason = "STOP"
             else:
                 reason = "TRAILING BE"
-            pnl = round((current_price - entry) * pos["shares"], 2)
-            balance += pos["cost"] + pnl
+            proceeds = actual_shares * actual_price
+            pnl = round(proceeds - pos["cost"], 2)
+            balance += proceeds
             pos["closed_at"]    = datetime.now(timezone.utc).isoformat()
             pos["close_reason"] = {
                 "TAKE": "take_profit",
                 "STOP": "stop_loss",
                 "TRAILING BE": "trailing_stop",
             }[reason]
-            pos["exit_price"]   = current_price
+            pos["exit_price"]   = actual_price
+            pos["sold_shares"]  = actual_shares
             pos["pnl"]          = pnl
             pos["status"]       = "closed"
             closed += 1
-            print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${current_price:.3f} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
+            print(f"  [{reason}] {city_name} {mkt['date']} | entry ${entry:.3f} exit ${actual_price:.3f} | sold {actual_shares} | {hours_left:.0f}h left | PnL: {'+'if pnl>=0 else ''}{pnl:.2f}")
             save_market(mkt)
 
     if closed:
