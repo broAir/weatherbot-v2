@@ -265,6 +265,16 @@ def parse_balance_from_error(exc):
     m = re.search(r"balance:\s*(\d+)", msg)
     return int(m.group(1)) if m else None
 
+def get_wallet_pusd_balance():
+    if not _is_valid_eth_address(WALLET_ADDRESS):
+        return None
+    try:
+        pusd_raw, _ = _erc20_balance_raw(WALLET_ADDRESS, TOKEN_PUSD)
+        return pusd_raw / 1e6
+    except Exception as e:
+        print(f"  [LIVE WARN] could not read pUSD balance for fee-adjusted buy: {e}")
+        return None
+
 def place_live_buy(token_id, price, size_usdc):
     """Returns False on failure, or actual on-chain shares (float) on success."""
     if not token_id:
@@ -272,13 +282,17 @@ def place_live_buy(token_id, price, size_usdc):
         return False
     try:
         clob = get_clob()
-        args = MarketOrderArgs(
-            token_id=token_id,
-            amount=round(float(size_usdc), 2),
-            side=CLOB_BUY,
-            price=round(float(price), 4),
-            order_type=OrderType.FOK,
-        )
+        order_kwargs = {
+            "token_id": token_id,
+            "amount": round(float(size_usdc), 2),
+            "side": CLOB_BUY,
+            "price": round(float(price), 4),
+            "order_type": OrderType.FOK,
+        }
+        pusd_balance = get_wallet_pusd_balance()
+        if pusd_balance is not None:
+            order_kwargs["user_usdc_balance"] = round(float(pusd_balance), 6)
+        args = MarketOrderArgs(**order_kwargs)
         signed = create_signed_market_order(clob, args)
         resp = post_live_order(clob, signed, OrderType.FOK, "Buy")
         if not live_order_succeeded(resp):
@@ -1467,6 +1481,7 @@ def monitor_positions():
             pos["stop_price"] = entry
             pos["trailing_activated"] = True
             print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
+            save_market(mkt)
 
         # Check take-profit
         take_triggered = take_profit is not None and current_price >= take_profit
