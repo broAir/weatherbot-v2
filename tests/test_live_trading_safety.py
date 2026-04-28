@@ -26,24 +26,33 @@ class _DummyOrderType:
     GTC = "GTC"
 
 
+class _DummyBalanceAllowanceParams:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+class _DummyAssetType:
+    CONDITIONAL = "CONDITIONAL"
+
 def _install_dependency_stubs():
     requests_module = types.ModuleType("requests")
     requests_module.get = lambda *args, **kwargs: None
 
-    py_clob_client_module = types.ModuleType("py_clob_client")
-    client_module = types.ModuleType("py_clob_client.client")
-    clob_types_module = types.ModuleType("py_clob_client.clob_types")
+    py_clob_client_module = types.ModuleType("py_clob_client_v2")
+    client_module = types.ModuleType("py_clob_client_v2.client")
+    clob_types_module = types.ModuleType("py_clob_client_v2.clob_types")
 
     client_module.ClobClient = object
     clob_types_module.ApiCreds = _DummyApiCreds
     clob_types_module.MarketOrderArgs = _DummyMarketOrderArgs
     clob_types_module.OrderArgs = _DummyOrderArgs
     clob_types_module.OrderType = _DummyOrderType
+    clob_types_module.BalanceAllowanceParams = _DummyBalanceAllowanceParams
+    clob_types_module.AssetType = _DummyAssetType
 
     sys.modules.setdefault("requests", requests_module)
-    sys.modules.setdefault("py_clob_client", py_clob_client_module)
-    sys.modules.setdefault("py_clob_client.client", client_module)
-    sys.modules.setdefault("py_clob_client.clob_types", clob_types_module)
+    sys.modules.setdefault("py_clob_client_v2", py_clob_client_module)
+    sys.modules.setdefault("py_clob_client_v2.client", client_module)
+    sys.modules.setdefault("py_clob_client_v2.clob_types", clob_types_module)
 
 
 def _load_bot(env):

@@ -21,8 +21,8 @@ import os
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
 CLOB_BUY  = "BUY"
 CLOB_SELL = "SELL"
 
@@ -156,7 +156,7 @@ GAMMA_GET_ATTEMPTS = 3
 GAMMA_GET_RETRY_SECONDS = 1
 
 TOKEN_MATIC = "0x0000000000000000000000000000000000001010"
-TOKEN_USDC_POS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+TOKEN_PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 TOKEN_USDC_NATIVE = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
 
 # =============================================================================
@@ -450,11 +450,11 @@ def print_wallet_balance():
     print(f"  Wallet:    {WALLET_ADDRESS}")
     try:
         pol_raw, rpc_url = _native_balance_raw(WALLET_ADDRESS)
-        usdc_pos_raw, _ = _erc20_balance_raw(WALLET_ADDRESS, TOKEN_USDC_POS)
+        pusd_raw, _ = _erc20_balance_raw(WALLET_ADDRESS, TOKEN_PUSD)
         usdc_native_raw, _ = _erc20_balance_raw(WALLET_ADDRESS, TOKEN_USDC_NATIVE)
         print(f"  RPC used:  {rpc_url}")
         print(f"  POL:       {pol_raw / 1e18:,.6f}")
-        print(f"  USDC PoS:  {usdc_pos_raw / 1e6:,.6f}")
+        print(f"  pUSD:      {pusd_raw / 1e6:,.6f}")
         print(f"  USDC:      {usdc_native_raw / 1e6:,.6f}")
     except Exception as e:
         print(f"  Error:     {e}")
