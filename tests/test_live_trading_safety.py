@@ -26,24 +26,33 @@ class _DummyOrderType:
     GTC = "GTC"
 
 
+class _DummyBalanceAllowanceParams:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+class _DummyAssetType:
+    CONDITIONAL = "CONDITIONAL"
+
 def _install_dependency_stubs():
     requests_module = types.ModuleType("requests")
     requests_module.get = lambda *args, **kwargs: None
 
-    py_clob_client_module = types.ModuleType("py_clob_client")
-    client_module = types.ModuleType("py_clob_client.client")
-    clob_types_module = types.ModuleType("py_clob_client.clob_types")
+    py_clob_client_module = types.ModuleType("py_clob_client_v2")
+    client_module = types.ModuleType("py_clob_client_v2.client")
+    clob_types_module = types.ModuleType("py_clob_client_v2.clob_types")
 
     client_module.ClobClient = object
     clob_types_module.ApiCreds = _DummyApiCreds
     clob_types_module.MarketOrderArgs = _DummyMarketOrderArgs
     clob_types_module.OrderArgs = _DummyOrderArgs
     clob_types_module.OrderType = _DummyOrderType
+    clob_types_module.BalanceAllowanceParams = _DummyBalanceAllowanceParams
+    clob_types_module.AssetType = _DummyAssetType
 
-    sys.modules.setdefault("requests", requests_module)
-    sys.modules.setdefault("py_clob_client", py_clob_client_module)
-    sys.modules.setdefault("py_clob_client.client", client_module)
-    sys.modules.setdefault("py_clob_client.clob_types", clob_types_module)
+    sys.modules["requests"] = requests_module
+    sys.modules["py_clob_client_v2"] = py_clob_client_module
+    sys.modules["py_clob_client_v2.client"] = client_module
+    sys.modules["py_clob_client_v2.clob_types"] = clob_types_module
 
 
 def _load_bot(env):
@@ -155,6 +164,33 @@ class LiveTradingSafetyTests(unittest.TestCase):
         self.assertEqual(fake.order_args.kwargs["price"], 0.3333)
         self.assertEqual(fake.order_args.kwargs["order_type"], bot.OrderType.FOK)
 
+    def test_live_buy_passes_wallet_balance_for_fee_adjusted_market_buy(self):
+        bot = _load_bot({
+            "PRIVATE_KEY": "set",
+            "POLY_API_KEY": "set",
+            "POLY_SECRET": "set",
+            "POLY_PASSPHRASE": "set",
+            "WALLET_ADDRESS": "0x1111111111111111111111111111111111111111",
+        })
+
+        class FakeClient:
+            def __init__(self):
+                self.order_args = None
+
+            def create_market_order(self, args):
+                self.order_args = args
+                return {"signed": True}
+
+            def post_order(self, signed, order_type):
+                return {"success": True, "orderID": "abc"}
+
+        fake = FakeClient()
+
+        with patch.object(bot, "get_clob", return_value=fake), patch.object(bot, "get_wallet_pusd_balance", return_value=20.527167):
+            self.assertTrue(bot.place_live_buy("token", 0.25, 1.00))
+
+        self.assertEqual(fake.order_args.kwargs["user_usdc_balance"], 20.527167)
+
     def test_live_buy_retries_transient_clob_request_exception(self):
         bot = _load_bot({
             "PRIVATE_KEY": "set",
@@ -235,6 +271,77 @@ class LiveTradingSafetyTests(unittest.TestCase):
 
         with patch.object(bot, "get_clob", return_value=FakeClient()):
             self.assertFalse(bot.place_live_buy("token", 0.25, 1.00))
+
+    def test_monitor_positions_saves_market_when_trailing_stop_activates(self):
+        bot = _load_bot({})
+        market = {
+            "city": "nyc",
+            "date": "2026-04-28",
+            "event_end_date": "2026-04-29T00:00:00+00:00",
+            "forecast_snapshots": [{"best": 72}],
+            "position": {
+                "status": "open",
+                "market_id": "market-1",
+                "entry_price": 0.20,
+                "bucket_low": 70,
+                "bucket_high": 75,
+                "shares": 5,
+                "cost": 1.00,
+            },
+        }
+
+        with (
+            patch.object(bot, "load_all_markets", return_value=[market]),
+            patch.object(bot, "load_state", return_value={"balance": 10.0}),
+            patch.object(bot, "get_gamma_json", return_value={"bestBid": "0.24"}),
+            patch.object(bot, "hours_to_resolution", return_value=12),
+            patch.object(bot, "save_market") as save_market,
+        ):
+            self.assertEqual(bot.monitor_positions(), 0)
+
+        self.assertEqual(market["position"]["stop_price"], 0.20)
+        self.assertTrue(market["position"]["trailing_activated"])
+        save_market.assert_called_once_with(market)
+
+    def test_monitor_positions_uses_outcome_price_when_best_bid_missing(self):
+        bot = _load_bot({})
+        market = {
+            "city": "paris",
+            "date": "2026-04-29",
+            "event_end_date": "2026-04-29T00:00:00+00:00",
+            "forecast_snapshots": [{"best": 20}],
+            "all_outcomes": [
+                {"market_id": "market-1", "bid": 0.99, "price": 0.99},
+            ],
+            "position": {
+                "status": "open",
+                "market_id": "market-1",
+                "entry_price": 0.30,
+                "stop_price": 0.24,
+                "bucket_low": 23,
+                "bucket_high": 23,
+                "shares": 5,
+                "cost": 1.50,
+            },
+        }
+
+        with (
+            patch.object(bot, "load_all_markets", return_value=[market]),
+            patch.object(bot, "load_state", return_value={"balance": 10.0}),
+            patch.object(bot, "get_gamma_json", return_value={"bestBid": None, "outcomePrices": "[\"0\", \"1\"]"}),
+            patch.object(bot, "hours_to_resolution", return_value=1),
+            patch.object(bot, "save_market") as save_market,
+            patch.object(bot, "save_state") as save_state,
+        ):
+            self.assertEqual(bot.monitor_positions(), 1)
+
+        pos = market["position"]
+        self.assertEqual(pos["status"], "closed")
+        self.assertEqual(pos["close_reason"], "stop_loss")
+        self.assertEqual(pos["exit_price"], 0.0)
+        self.assertEqual(pos["pnl"], -1.5)
+        save_market.assert_called_once_with(market)
+        save_state.assert_called_once_with({"balance": 10.0})
 
 
 if __name__ == "__main__":

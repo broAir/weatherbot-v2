@@ -21,8 +21,8 @@ import os
 import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
+from py_clob_client_v2.client import ClobClient
+from py_clob_client_v2.clob_types import ApiCreds, MarketOrderArgs, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
 CLOB_BUY  = "BUY"
 CLOB_SELL = "SELL"
 
@@ -156,7 +156,7 @@ GAMMA_GET_ATTEMPTS = 3
 GAMMA_GET_RETRY_SECONDS = 1
 
 TOKEN_MATIC = "0x0000000000000000000000000000000000001010"
-TOKEN_USDC_POS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+TOKEN_PUSD = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 TOKEN_USDC_NATIVE = "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
 
 # =============================================================================
@@ -265,6 +265,16 @@ def parse_balance_from_error(exc):
     m = re.search(r"balance:\s*(\d+)", msg)
     return int(m.group(1)) if m else None
 
+def get_wallet_pusd_balance():
+    if not _is_valid_eth_address(WALLET_ADDRESS):
+        return None
+    try:
+        pusd_raw, _ = _erc20_balance_raw(WALLET_ADDRESS, TOKEN_PUSD)
+        return pusd_raw / 1e6
+    except Exception as e:
+        print(f"  [LIVE WARN] could not read pUSD balance for fee-adjusted buy: {e}")
+        return None
+
 def place_live_buy(token_id, price, size_usdc):
     """Returns False on failure, or actual on-chain shares (float) on success."""
     if not token_id:
@@ -272,13 +282,17 @@ def place_live_buy(token_id, price, size_usdc):
         return False
     try:
         clob = get_clob()
-        args = MarketOrderArgs(
-            token_id=token_id,
-            amount=round(float(size_usdc), 2),
-            side=CLOB_BUY,
-            price=round(float(price), 4),
-            order_type=OrderType.FOK,
-        )
+        order_kwargs = {
+            "token_id": token_id,
+            "amount": round(float(size_usdc), 2),
+            "side": CLOB_BUY,
+            "price": round(float(price), 4),
+            "order_type": OrderType.FOK,
+        }
+        pusd_balance = get_wallet_pusd_balance()
+        if pusd_balance is not None:
+            order_kwargs["user_usdc_balance"] = round(float(pusd_balance), 6)
+        args = MarketOrderArgs(**order_kwargs)
         signed = create_signed_market_order(clob, args)
         resp = post_live_order(clob, signed, OrderType.FOK, "Buy")
         if not live_order_succeeded(resp):
@@ -450,11 +464,11 @@ def print_wallet_balance():
     print(f"  Wallet:    {WALLET_ADDRESS}")
     try:
         pol_raw, rpc_url = _native_balance_raw(WALLET_ADDRESS)
-        usdc_pos_raw, _ = _erc20_balance_raw(WALLET_ADDRESS, TOKEN_USDC_POS)
+        pusd_raw, _ = _erc20_balance_raw(WALLET_ADDRESS, TOKEN_PUSD)
         usdc_native_raw, _ = _erc20_balance_raw(WALLET_ADDRESS, TOKEN_USDC_NATIVE)
         print(f"  RPC used:  {rpc_url}")
         print(f"  POL:       {pol_raw / 1e18:,.6f}")
-        print(f"  USDC PoS:  {usdc_pos_raw / 1e6:,.6f}")
+        print(f"  pUSD:      {pusd_raw / 1e6:,.6f}")
         print(f"  USDC:      {usdc_native_raw / 1e6:,.6f}")
     except Exception as e:
         print(f"  Error:     {e}")
@@ -703,6 +717,21 @@ def get_market_price(market_id):
         return float(prices[0])
     except Exception:
         return None
+
+def get_gamma_yes_price(mdata):
+    best_bid = mdata.get("bestBid")
+    if best_bid is not None:
+        try:
+            return float(best_bid)
+        except Exception:
+            pass
+    try:
+        prices = json.loads(mdata.get("outcomePrices", "[]"))
+        if prices and prices[0] is not None:
+            return float(prices[0])
+    except Exception:
+        pass
+    return None
 
 def parse_temp_range(question):
     if not question: return None
@@ -1430,13 +1459,11 @@ def monitor_positions():
                 timeout=(3, 5),
                 label=f"MONITOR {mid}",
             )
-            best_bid = mdata.get("bestBid")
-            if best_bid is not None:
-                current_price = float(best_bid)
+            current_price = get_gamma_yes_price(mdata)
         except Exception:
             pass
 
-        # Fallback to cached price if API failed
+        # Fallback to cached price if Gamma has neither bestBid nor outcomePrices.
         if current_price is None:
             for o in mkt.get("all_outcomes", []):
                 if o["market_id"] == mid:
@@ -1467,6 +1494,7 @@ def monitor_positions():
             pos["stop_price"] = entry
             pos["trailing_activated"] = True
             print(f"  [TRAILING] {city_name} {mkt['date']} — stop moved to breakeven ${entry:.3f}")
+            save_market(mkt)
 
         # Check take-profit
         take_triggered = take_profit is not None and current_price >= take_profit

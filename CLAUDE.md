@@ -18,11 +18,10 @@ Weather-market trading bot for Polymarket. Core file: `bot_v2.py`. Config: `conf
 - **Config:** Read `config.json` before editing. Add new fields at end. Load with `_cfg.get(key, default)` in the CONFIG block (~line 42).
 - **State:** Always call `save_state(state)` after mutating the state dict.
 - **Markets:** Always call `save_market(mkt)` after mutating a market dict. Files live in `data/markets/`.
-- **CSV:** All trades via `log_trade_to_csv()`. Schema: `timestamp, event, city, bucket, entry_price, exit_price, cost, pnl, close_reason, balance, forecast_src`. Adding a column requires updating the header write too.
 - **API:** Gamma endpoint `https://gamma-api.polymarket.com/markets/{market_id}`. Timeout `(3, 5)`. Fail gracefully — never crash on connection errors.
 
 ## Running the Bot — One Process Only
-- **Never run multiple `bot_v2.py run` processes at once.** They share `data/state.json`, `data/markets/*.json`, and `data/trades_log.csv` — concurrent writers corrupt state. They also multiply requests against the Polymarket Gamma + CLOB APIs, triggering rate-limits that look like socket hangs (especially on cities with open positions like Buenos Aires).
+- **Never run multiple `bot_v2.py run` processes at once.** They share `data/state.json` and `data/markets/*.json` — concurrent writers corrupt state. They also multiply requests against the Polymarket Gamma + CLOB APIs, triggering rate-limits that look like socket hangs (especially on cities with open positions like Buenos Aires).
 - Before `python bot_v2.py run`, verify nothing else is running: `ps aux | grep "bot_v2.py" | grep -v grep`. If anything appears, `pkill -9 -f "bot_v2.py"` and re-check.
 - After `pkill`, ALWAYS re-check the count — `pkill` can leave zombies, especially when the bot was launched repeatedly via background tasks.
 - If the bot appears stuck on a single city for >60s, the first thing to check is process count, NOT the city's API or a code timeout. Multiple processes is the usual culprit.
