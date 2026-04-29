@@ -303,6 +303,46 @@ class LiveTradingSafetyTests(unittest.TestCase):
         self.assertTrue(market["position"]["trailing_activated"])
         save_market.assert_called_once_with(market)
 
+    def test_monitor_positions_uses_outcome_price_when_best_bid_missing(self):
+        bot = _load_bot({})
+        market = {
+            "city": "paris",
+            "date": "2026-04-29",
+            "event_end_date": "2026-04-29T00:00:00+00:00",
+            "forecast_snapshots": [{"best": 20}],
+            "all_outcomes": [
+                {"market_id": "market-1", "bid": 0.99, "price": 0.99},
+            ],
+            "position": {
+                "status": "open",
+                "market_id": "market-1",
+                "entry_price": 0.30,
+                "stop_price": 0.24,
+                "bucket_low": 23,
+                "bucket_high": 23,
+                "shares": 5,
+                "cost": 1.50,
+            },
+        }
+
+        with (
+            patch.object(bot, "load_all_markets", return_value=[market]),
+            patch.object(bot, "load_state", return_value={"balance": 10.0}),
+            patch.object(bot, "get_gamma_json", return_value={"bestBid": None, "outcomePrices": "[\"0\", \"1\"]"}),
+            patch.object(bot, "hours_to_resolution", return_value=1),
+            patch.object(bot, "save_market") as save_market,
+            patch.object(bot, "save_state") as save_state,
+        ):
+            self.assertEqual(bot.monitor_positions(), 1)
+
+        pos = market["position"]
+        self.assertEqual(pos["status"], "closed")
+        self.assertEqual(pos["close_reason"], "stop_loss")
+        self.assertEqual(pos["exit_price"], 0.0)
+        self.assertEqual(pos["pnl"], -1.5)
+        save_market.assert_called_once_with(market)
+        save_state.assert_called_once_with({"balance": 10.0})
+
 
 if __name__ == "__main__":
     unittest.main()

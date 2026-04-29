@@ -718,6 +718,21 @@ def get_market_price(market_id):
     except Exception:
         return None
 
+def get_gamma_yes_price(mdata):
+    best_bid = mdata.get("bestBid")
+    if best_bid is not None:
+        try:
+            return float(best_bid)
+        except Exception:
+            pass
+    try:
+        prices = json.loads(mdata.get("outcomePrices", "[]"))
+        if prices and prices[0] is not None:
+            return float(prices[0])
+    except Exception:
+        pass
+    return None
+
 def parse_temp_range(question):
     if not question: return None
     num = r'(-?\d+(?:\.\d+)?)'
@@ -1444,13 +1459,11 @@ def monitor_positions():
                 timeout=(3, 5),
                 label=f"MONITOR {mid}",
             )
-            best_bid = mdata.get("bestBid")
-            if best_bid is not None:
-                current_price = float(best_bid)
+            current_price = get_gamma_yes_price(mdata)
         except Exception:
             pass
 
-        # Fallback to cached price if API failed
+        # Fallback to cached price if Gamma has neither bestBid nor outcomePrices.
         if current_price is None:
             for o in mkt.get("all_outcomes", []):
                 if o["market_id"] == mid:
